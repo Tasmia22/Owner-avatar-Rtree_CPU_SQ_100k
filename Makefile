@@ -1,3 +1,4 @@
+export UPMEM_NO_OS_WARNING = 1
 DPU_DIR := dpu
 HOST_DIR := host
 BUILDDIR ?= build
