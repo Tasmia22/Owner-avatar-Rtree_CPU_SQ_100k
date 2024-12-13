@@ -1,0 +1,206 @@
+
+#include <defs.h>
+#include <mram.h>
+#include <perfcounter.h>
+#include <stdint.h>
+#include <stdio.h>
+
+#include "common.h"
+
+#define BLOCK_SIZE (256)
+
+// Structure to define a point
+typedef struct Point
+{
+    float x, y;
+} Point;
+
+// Structure to define a bounding box (MBR)
+typedef struct MBR
+{
+    float xmin, ymin;
+    float xmax, ymax;
+} MBR;
+
+// Structure for a node
+typedef struct Node
+{
+    int isLeaf; // 1 if it's a leaf node, 0 if it's an internal node
+    int count;  // Number of entries in the node
+    MBR mbr;    // Bounding box for the node
+    union
+    {
+        struct Node **children; // Child nodes (internal node)
+        Point *points;          // Points (leaf node)
+    };
+} Node;
+
+// Structure for a serialized node
+typedef struct SerializedNode
+{
+    int isLeaf;       // 1 if it's a leaf node, 0 if it's an internal node
+    int count;        // Number of entries in the node
+    MBR mbr;          // Bounding box for the node
+    int children[16]; // Indices of child nodes (internal node), max FANOUT assumed to be 16
+    Point points[16]; // Points (leaf node), max BUNDLEFACTOR assumed to be 16
+} SerializedNode;
+
+// MRAM Variables
+__mram_noinit uint64_t DPU_INDEX;
+__mram_noinit Point DPU_QUERY_POINT;
+__mram_noinit SerializedNode DPU_TREE[MAX_NODES];
+__mram_noinit uint64_t DPU_RESULT;
+
+// Recursive function to search a query point in the serialized R-tree
+bool search_rtree_dpu(int node_index, Point query_point, int tasklet, int height)
+{
+
+    height++;
+    // printf("\n Tasklet %d is searching in index %d with height=%d \n",tasklet,node_index,height);
+    // Check if the query point is within the MBR of the current node
+    if (!(query_point.x >= DPU_TREE[node_index].mbr.xmin && query_point.x <= DPU_TREE[node_index].mbr.xmax && query_point.y >= DPU_TREE[node_index].mbr.ymin && query_point.y <= DPU_TREE[node_index].mbr.ymax))
+    {
+        return false; // Query point is outside the MBR
+    }
+
+    if (DPU_TREE[node_index].isLeaf)
+    {
+
+        // Search in the points of the leaf node
+        for (int i = 0; i < DPU_TREE[node_index].count; i++)
+        {
+            if (query_point.x == DPU_TREE[node_index].points[i].x && query_point.y == DPU_TREE[node_index].points[i].y)
+            {
+                return true;
+            }
+        }
+        return false; // Not found in this leaf node
+    }
+    else
+    {
+       /* 
+        if (height == 2)
+        {
+            int tasklet_task = (FANOUT) / NR_TASKLETS;
+            // Recursively search in the child nodes
+            for (int i = tasklet; i < tasklet_task; i++)
+            {
+                if (i == NR_TASKLETS)
+                    return false;
+                if (search_rtree_dpu(DPU_TREE[node_index].children[i], query_point, tasklet, height))
+                {
+                    return true;
+                }
+            }
+        }
+        else
+     */   
+        {
+            // Recursively search in the child nodes
+            for (int i = 0; i < DPU_TREE[node_index].count; i++)
+            {
+                //printf("\nSearching in NODE INDEX=%d and Its CHILD=%d\n", node_index, DPU_TREE[node_index].children[i]);
+                if (search_rtree_dpu(DPU_TREE[node_index].children[i], query_point, tasklet, height))
+                {
+                    return true;
+                }
+            }
+        }
+        return false; // Not found in any child nodes
+    }
+}
+
+void print_point(Point p)
+{
+    printf("(%.1f, %.1f)", p.x, p.y);
+}
+
+// Function to print an MBR
+void print_mbr(MBR mbr)
+{
+    printf("MBR [xmin: %.1f, ymin: %.1f, xmax: %.1f, ymax: %.1f]",
+           mbr.xmin, mbr.ymin, mbr.xmax, mbr.ymax);
+}
+
+void print_rtree_dpu(int node_index, int depth)
+{
+    // Print node information
+    printf("Node Index: %d | ", node_index);
+    printf("MBR [xmin: %.1f, ymin: %.1f, xmax: %.1f, ymax: %.1f]",
+           DPU_TREE[node_index].mbr.xmin, DPU_TREE[node_index].mbr.ymin, DPU_TREE[node_index].mbr.xmax, DPU_TREE[node_index].mbr.ymax);
+    printf(" | isLeaf: %d | count: %d\n", DPU_TREE[node_index].isLeaf, DPU_TREE[node_index].count);
+
+    if (DPU_TREE[node_index].isLeaf)
+    {
+        // Print points in the leaf node
+        for (int i = 0; i < DPU_TREE[node_index].count; i++)
+        {
+            for (int j = 0; j < depth + 1; j++)
+            {
+                printf("  ");
+            }
+            printf("Point: ");
+            print_point(DPU_TREE[node_index].points[i]);
+            printf("\n");
+        }
+    }
+    else
+    {
+        // Recursively print child nodes
+        for (int i = 0; i < DPU_TREE[node_index].count; i++)
+        {
+            //printf("\n\nNODE INDEX=%d and Its CHILD=%d\n", node_index, DPU_TREE[node_index].children[i]);
+            print_rtree_dpu(DPU_TREE[node_index].children[i], depth + 1);
+        }
+    }
+}
+
+int main()
+{
+    uint32_t tasklet_id = me(); // Tasklet ID (0 to NR_TASKLETS - 1)
+    uint64_t dpu_index = DPU_INDEX;
+    /*
+        if (tasklet_id == 0)
+        {
+            printf("\nPrinting the nodes that have been RECEIVED to the DPU %lu\n",dpu_index);
+           for (int i = 0; i < 7; i++)
+           {
+               printf("Node %d: isLeaf=%d, count=%d, MBR=[%.1f, %.1f, %.1f, %.1f]\n",
+                      i, DPU_TREE[i].isLeaf, DPU_TREE[i].count,
+                      DPU_TREE[i].mbr.xmin, DPU_TREE[i].mbr.ymin,
+                      DPU_TREE[i].mbr.xmax, DPU_TREE[i].mbr.ymax);
+           }
+
+        }
+    */
+    // Tasklet 0 prints the entire DPU_TREE
+    if (tasklet_id == 0)
+    {
+        printf("\n|| Printing DPU_TREE in DPU ID: %lu ||\n", dpu_index);
+       // print_rtree_dpu(0, 0); // Start printing from the root node
+    }
+
+    // Calculate the base number of queries per tasklet
+    int nodes_per_tasklet = (FANOUT) / NR_TASKLETS;
+
+    // Each tasklet processes its subset of queries
+    for (uint64_t i = tasklet_id; i < (FANOUT + 2); i += nodes_per_tasklet)
+    {
+        // Perform the search for this query point
+        DPU_RESULT = (uint64_t)search_rtree_dpu(0, DPU_QUERY_POINT, i, 0);
+
+        // Print the result for each query
+        if (DPU_RESULT)
+        {
+            printf("\nTasklet %d found query point (%.1f, %.1f) on DPU ID: %lu.\n",
+                   tasklet_id, DPU_QUERY_POINT.x, DPU_QUERY_POINT.y, dpu_index);
+        }
+        else
+        {
+            // printf("\nTasklet %d did " ANSI_COLOR_RED "not find" ANSI_COLOR_RESET " query point (%.1f, %.1f) on DPU ID: %lu.\n",
+            // tasklet_id, query_point.x, query_point.y, dpu_index);
+        }
+
+        return 0;
+    }
+}

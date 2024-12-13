@@ -1,0 +1,228 @@
+#include <dpu.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <float.h>
+#include <time.h>
+#include "common.h"
+
+#ifndef DPU_BINARY
+#define DPU_BINARY "build/dpu"
+#endif
+
+// Structure to define a point
+typedef struct Point
+{
+    float x, y;
+} Point;
+
+// Structure to define a bounding box (MBR)
+typedef struct MBR
+{
+    float xmin, ymin;
+    float xmax, ymax;
+} MBR;
+
+// Structure for a node
+typedef struct Node
+{
+    int isLeaf; // 1 if it's a leaf node, 0 if it's an internal node
+    int count;  // Number of entries in the node
+    MBR mbr;    // Bounding box for the node
+    union
+    {
+        struct Node **children; // Child nodes (internal node)
+        Point *points;          // Points (leaf node)
+    };
+} Node;
+
+// Structure for a serialized node
+typedef struct SerializedNode
+{
+    int isLeaf;       // 1 if it's a leaf node, 0 if it's an internal node
+    int count;        // Number of entries in the node
+    MBR mbr;          // Bounding box for the node
+    int children[16]; // Indices of child nodes (internal node), max FANOUT assumed to be
+    Point points[16]; // Points (leaf node), max BUNDLEFACTOR assumed to be
+} SerializedNode;
+
+// Forward declarations for helper functions
+int readPointsFromFile(const char *filename, Point points[], int max_points);
+void printPoints(Point points[], int num_points);
+Node *createRTree(Point *ptArr, int low, int high);
+void printRTree(Node *node, int level);
+bool searchRTree(Node *node, Point queryPoint);
+void Zsorting(Point points[], int num_points);
+int serialize_rtree_wrapper(Node *root, SerializedNode **output, int max_nodes);
+void print_serialisedtree(int node_index, int depth, SerializedNode *serialized_tree);
+SerializedNode *serialized_tree;
+
+int main()
+{
+    struct dpu_set_t dpu_set, dpu;
+    uint32_t nr_of_dpus;
+    bool status = true;
+    bool result_host = false;
+    // uint64_t dpu_index = 0;
+
+    clock_t start_time, end_time;
+    double rtree_construction_time;
+
+    Point points[MAX_POINTS];
+    int numPoints = readPointsFromFile("/home/tjv7w/PIM/RtreeCPU_SingleQuery/Data/datapoint.txt", points, MAX_POINTS);
+    // int numPoints = readPointsFromFile("/home/tjv7w/PIM/RtreeCPU_QueryM/Data/gaussian_data_points_1k.csv", points, MAX_POINTS);
+    // int numPoints = readPointsFromFile("/home/tjv7w/PIM/RtreeCPU_QueryM/Data/gaussian_data_points_1M.csv", points, MAX_POINTS);
+    if (numPoints <= 0)
+    {
+        printf("Failed to read points from the file.\n");
+        return 1;
+    }
+    Zsorting(points, numPoints);
+    // printf("\nSorted Points by Z-value:\n");
+    // printPoints(points, numPoints);
+
+    // Build the R-tree on the host
+    start_time = clock();
+    Node *root = createRTree(points, 0, numPoints - 1);
+    end_time = clock();
+    rtree_construction_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    printf("R-tree construction time: %.3f μs\n", rtree_construction_time * 1000000);
+    // printRTree(root, 0);
+
+    Point query_point = {4792855.00, 6027188.00};
+    start_time = clock();
+
+    result_host = searchRTree(root, query_point);
+    if (result_host)
+    {
+        printf("\nQuery point (%.1f, %.1f) " ANSI_COLOR_GREEN "FOUND" ANSI_COLOR_RESET " in R-tree in HOST", query_point.x, query_point.y);
+    }
+    end_time = clock();
+    double search_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+
+    printf("\n Time taken to search the point in HOST is %.3f μs\n", search_time * 1000000);
+
+    // Serialize the R-tree
+    int num_nodes = serialize_rtree_wrapper(root, &serialized_tree, MAX_NODES);
+    if (num_nodes <= 0)
+    {
+        printf("Failed to serialize the R-tree.\n");
+        return 1;
+    }
+    printf("\nSerialized R-tree with %d nodes in CPU side\n", num_nodes);
+    printf("\nSize of single serialised node =%ld\n", sizeof(SerializedNode));
+    printf("\nAll Serialized_Node size=%ld\n", num_nodes * sizeof(SerializedNode));
+
+    // print_serialisedtree(0, 0, serialized_tree);
+    //  Output the serialized tree for debugging
+    /*
+        for (int i = 0; i < num_nodes; i++)
+        {
+            printf("Node %d: isLeaf=%d, count=%d, MBR=[%.1f, %.1f, %.1f, %.1f]\n",
+                   i, serialized_tree[i].isLeaf, serialized_tree[i].count,
+                   serialized_tree[i].mbr.xmin, serialized_tree[i].mbr.ymin,
+                   serialized_tree[i].mbr.xmax, serialized_tree[i].mbr.ymax);
+        }
+    */
+
+    // Allocate DPU set and load the DPU program
+    DPU_ASSERT(dpu_alloc(NR_DPUS, NULL, &dpu_set));
+    DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
+
+    DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &nr_of_dpus));
+    printf("\nAllocated %d DPU(s)\n", nr_of_dpus);
+
+    // int nodes_per_dpu = num_nodes / nr_of_dpus;
+
+    printf("\nPassing Tree and Query to DPUs...\n");
+
+    // Distribute serialized tree and queries to DPUs
+
+    printf("\nPassing Data Points DPUs...\n");
+
+    // Split the data and send them to the DPUs
+    uint64_t dpu_id = 0;
+    SerializedNode dpu_node[FANOUT + 2];
+    DPU_FOREACH(dpu_set, dpu)
+    {
+        int start_index = dpu_id * (FANOUT + 1) + 1;
+        int end_index = start_index + (FANOUT + 1);
+
+        if (dpu_id == (nr_of_dpus - 1))
+        {
+            end_index = num_nodes;
+        }
+        dpu_node[0] = serialized_tree[0];
+        dpu_node[0].count = 1;
+        int k = 1;
+        for (int i = start_index; i < end_index; i++)
+        {
+
+            dpu_node[k] = serialized_tree[i];
+            for (int childid = 0; childid < dpu_node[k].count; childid++)
+            {
+                dpu_node[k].children[childid] = childid + k + 1;
+            }
+            k++;
+        }
+/*
+        printf("\nPrinting the %d nodes that have been sent to the DPU %lu\n", k, dpu_id);
+        for (int i = 0; i < k; i++)
+        {
+            printf("\nNode %d: isLeaf=%d, count=%d, MBR=[%.1f, %.1f, %.1f, %.1f]\n",
+                   i, dpu_node[i].isLeaf, dpu_node[i].count,
+                   dpu_node[i].mbr.xmin, dpu_node[i].mbr.ymin,
+                   dpu_node[i].mbr.xmax, dpu_node[i].mbr.ymax);
+        }
+*/
+        printf("\n %d nodes send to DPU id =%lu\n", k, dpu_id);
+        print_serialisedtree(0, 0, dpu_node);
+
+        DPU_ASSERT(dpu_copy_to(dpu, "DPU_INDEX", 0, &dpu_id, sizeof(uint64_t)));
+        DPU_ASSERT(dpu_copy_to(dpu, "DPU_TREE", 0, dpu_node, k * sizeof(SerializedNode)));
+        dpu_id++;
+    }
+
+    printf("\nSend Query value to DPUs...\n");
+
+    DPU_FOREACH(dpu_set, dpu)
+    {
+
+        DPU_ASSERT(dpu_copy_to(dpu, "DPU_QUERY_POINT", 0, &query_point, sizeof(Point)));
+    }
+
+    printf("\nRunning Query on DPU(s)...\n");
+    DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+
+    DPU_FOREACH(dpu_set, dpu)
+    {
+        DPU_ASSERT(dpu_log_read(dpu, stdout));
+    }
+
+    // Retrieve results from DPUs after execution
+    printf("\nRetrieve results from DPUs after execution\n");
+    dpu_id = 0;
+    uint64_t dpu_result;
+    DPU_FOREACH(dpu_set, dpu)
+    {
+
+        DPU_ASSERT(dpu_copy_from(dpu, "DPU_RESULT", 0, &dpu_result, sizeof(uint64_t)));
+        // printf("\ndpu_id=%lu, dpu_result= %lu",dpu_id,dpu_result);
+
+        if (dpu_result)
+        {
+            printf("\nQuery point (%.1f, %.1f) " ANSI_COLOR_GREEN "FOUND" ANSI_COLOR_RESET " in R-tree in DPU: %lu.\n", query_point.x, query_point.y, dpu_id);
+        }
+        else
+        {
+            // printf("\nQuery point (%.1f, %.1f) " ANSI_COLOR_RED "NOT FOUND" ANSI_COLOR_RESET " in R-tree in DPU: %lu.\n", query_point.x, query_point.y, dpu_id);
+        }
+        dpu_id++;
+    }
+
+    // Free the DPU set
+    DPU_ASSERT(dpu_free(dpu_set));
+
+    return status ? 0 : -1;
+}
